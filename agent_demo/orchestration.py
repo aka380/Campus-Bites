@@ -16,11 +16,19 @@ DEVELOPERS = ("Backend", "Frontend")
 
 
 def parse_decision(text: str) -> dict:
-    """Require manager-produced JSON, tolerate Markdown code fences but not invented defaults."""
+    """Require manager-produced JSON, tolerate Markdown code fences and surrounding text, but not invented defaults."""
     source = text.strip()
-    fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", source, flags=re.I | re.S)
+    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", source, flags=re.I | re.S)
     if fenced:
         source = fenced.group(1).strip()
+    else:
+        brace_match = re.search(r"\{[^{}]*\"assign\"[^{}]*\}", source, flags=re.S)
+        if brace_match:
+            source = brace_match.group(0).strip()
+        elif source.startswith("```"):
+            inner = re.sub(r"^```(?:json)?\s*", "", source, flags=re.I)
+            inner = re.sub(r"\s*```$", "", inner)
+            source = inner.strip()
     obj = json.loads(source)
     if not isinstance(obj, dict) or not isinstance(obj.get("assign"), str):
         raise ValueError('Manager must return JSON with string field "assign"')
