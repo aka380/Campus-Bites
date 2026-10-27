@@ -23,6 +23,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -491,7 +492,11 @@ def main() -> int:
             from crewai import Agent, Crew, LLM, Process, Task
             from crewai.tools import tool
         except ImportError as exc:
-            emit("System", "CrewAI dependencies missing", "Install agent_demo/requirements.txt. " + scrub(exc), "error")
+            install_command = shlex.join([sys.executable, "-m", "pip", "install", "-r", "agent_demo/requirements.txt"])
+            emit("System", "CrewAI dependencies missing",
+                 f"Python: {sys.executable}. Install dependencies with: {install_command}. "
+                 "Set PYTHON in .env to this environment's Python executable and restart the server. "
+                 + scrub(exc), "error")
             rc = 2
             return rc
 

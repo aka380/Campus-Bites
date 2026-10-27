@@ -1,79 +1,75 @@
 // site/feature.js
-/** CampusBites feature: Student Discount coupon handling in the bag view */
-export const feature = {
-  name: 'Student Discount',
-  slot: 'bag',
-};
+/** CampusBites feature implementation for menu slot.
+ * Provides a vegetarian filter and coupon application.
+ */
+export const feature = { name: 'Veg-Only Filter and Coupon', slot: 'menu' };
 
-/** Initial UI state */
+// Initial state for the feature
 export function initialState() {
   return {
-    coupon: '', // entered coupon code
-    discount: 0, // last known discount from server (used for immediate feedback)
-    error: '', // error message to display
+    vegOnly: false,
+    coupon: null,
+    discount: 0,
   };
 }
 
-/** Helper to compute discount based on view subtotal and coupon */
-function computeDiscount(coupon, view) {
-  if (!coupon) return 0;
-  const code = coupon.trim().toUpperCase();
-  if (code !== 'STUDENT10') return 0;
-  const subtotal = view.subtotal; // food subtotal (delivery excluded)
-  if (subtotal < 299) return 0;
-  let disc = Math.round(subtotal * 0.10);
-  if (disc > 100) disc = 100;
-  return disc;
-}
-
-/** Render the bag panel */
+// Render the UI for the feature panel
 export function render(view) {
-  const { coupon, error, discount } = view.state;
-  const input = `<input name="coupon" value="${view.esc(coupon)}" placeholder="Enter coupon code" />`;
-  const button = `<button data-action="apply-coupon">Apply</button>`;
-  const errorMsg = error ? `<p class="error">${view.esc(error)}</p>` : '';
-  // Show current discount (recomputed) for user feedback
-  const currentDiscount = computeDiscount(coupon, view);
-  const status = currentDiscount > 0 ? `<p class="success">Discount applied: -₹${currentDiscount}</p>` : '';
-  return `
-    <div class="row">
-      ${input}
-      ${button}
-    </div>
-    ${status}
-    ${errorMsg}
-  `;
+  const { vegOnly, coupon } = view.state;
+  // Checkbox for veg filter
+  const vegChecked = vegOnly ? 'checked' : '';
+  const vegHtml = `<div class="row"><label><input type="checkbox" name="vegOnly" data-action="toggleVeg" ${vegChecked}> Veg Only</label></div>`;
+  // Coupon input and apply button
+  const codeVal = coupon ? view.esc(coupon) : '';
+  const couponHtml = `<div class="row"><input name="code" placeholder="Coupon code" value="${codeVal}"><button data-action="apply">Apply</button></div>`;
+  return vegHtml + couponHtml;
 }
 
-/** Handle actions from the UI */
+// Handle actions from the UI
 export async function onAction(action, input, view, api) {
   const state = view.state;
-  if (action === 'apply-coupon') {
-    const couponCode = (input.coupon ?? '').trim();
-    // Prepare items for server validation (id and qty only)
-    const items = view.items.map((it) => ({ id: it.id, qty: it.qty }));
+  if (action === 'toggleVeg') {
+    // input.vegOnly is boolean from checkbox
+    return { ...state, vegOnly: !!input.vegOnly };
+  }
+  if (action === 'apply') {
+    const code = (input.code || '').trim();
+    if (!code) return state;
+    // Build items map from view.items (array of {id, qty})
+    const items = {};
+    for (const it of view.items) {
+      if (it.qty > 0) items[it.id] = it.qty;
+    }
     try {
-      const res = await api('apply-coupon', { code: couponCode, items });
+      const res = await api('apply-coupon', { code, items });
       if (res.valid) {
-        // Store coupon; discount will be recomputed in summaryLines/render
-        return { ...state, coupon: couponCode, discount: res.discount, error: '' };
+        return { ...state, coupon: code, discount: res.discount };
+      } else {
+        // invalid coupon clears discount but keep code for UI display
+        return { ...state, coupon: code, discount: 0 };
       }
-      // Invalid or not eligible
-      return { ...state, coupon: couponCode, discount: 0, error: 'Invalid coupon or not eligible' };
     } catch (e) {
-      return { ...state, error: e.message || 'Error applying coupon', discount: 0 };
+      // network or server error – keep state unchanged
+      return state;
     }
   }
-  // Unknown action – no state change
+  // unknown action – no state change
   return state;
 }
 
-/** Provide extra summary line for the bag */
+// Optional: add a summary line for discount
 export function summaryLines(view) {
-  const { coupon } = view.state;
-  const disc = computeDiscount(coupon, view);
-  if (disc > 0) {
-    return [{ label: `Student Discount (${coupon.trim().toUpperCase()})`, amount: -disc }];
+  const { coupon, discount } = view.state;
+  if (coupon && discount > 0) {
+    return [{ label: coupon, amount: -discount }];
   }
   return [];
+}
+
+// Optional: filter products based on vegOnly flag
+export function filterProducts(products, view) {
+  if (view.state.vegOnly) {
+    return products.filter(p => p.veg);
+  }
+  return products;
 }
