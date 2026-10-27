@@ -95,7 +95,7 @@ function updateStatuses(){
     if(milestone)milestone.className='milestone-marker'+(status==='waiting'?'':status==='working'?' running':status==='done'?' done':' error');
   }
   // QA works twice: writing tests first, then verifying. Split it across two milestones.
-  const qa=snapshot.events.filter(e=>e.actor==='QA'), wroteAt=qa.findIndex(e=>/Acceptance tests written/.test(e.title));
+  const qa=snapshot.events.filter(e=>e.actor==='QA'), wroteAt=qa.findIndex(e=>/Acceptance tests written|Regression tests preserved/.test(e.title));
   const testsMile=$('mile-Tests'), verifyMile=$('mile-QA');
   testsMile.className='milestone-marker'+(wroteAt>=0?' done':qa.length?(qa.at(-1).type==='error'?' error':' running'):'');
   const starts=qa.map((e,i)=>e.title==='CrewAI specialist started'?i:-1).filter(i=>i>=0);
@@ -172,6 +172,8 @@ function renderInspector(){
 }
 function updateLabels(){
   const mode=snapshot.mode;
+  const needsReset=snapshot.workspaceReset===false;
+  const installed=mode==='idle' && snapshot.featureWritten;
   const decisions=snapshot.manager?.decisions||[];
   const decision=decisions.at(-1);
   const state=snapshot.manager?.state;
@@ -181,7 +183,7 @@ function updateLabels(){
   $('manager-progress').textContent=`${steps} / 5 steps`;
   $('manager-retries').textContent=`Corrections ${state?.retry_count||0} / ${state?.max_corrections??1}`;
   const badge=$('display-mode');badge.className='mode-pill'+(mode==='live'?' live':mode==='preview'?' preview':'');
-  badge.textContent=mode==='live'?(snapshot.runOutcome==='passed'?'LIVE · VERIFIED':snapshot.runOutcome==='failed'?'LIVE · FAILED':'LIVE · RUNNING'):mode==='preview'?'SCRIPTED · NO MODEL':mode==='reference'?'MANUAL REFERENCE':'READY';
+  badge.textContent=mode==='live'?(snapshot.runOutcome==='passed'?'LIVE · VERIFIED':snapshot.runOutcome==='failed'?'LIVE · FAILED':'LIVE · RUNNING'):mode==='preview'?'SCRIPTED · NO MODEL':mode==='reference'?'MANUAL REFERENCE':installed?'LOCAL FEATURE':'READY';
   $('run-indicator').textContent=snapshot.runId?`RUN ${snapshot.runId}`:mode==='preview'?'ILLUSTRATION ONLY':mode==='reference'?'NOT AN AGENT RUN':'READY';
   $('credential-state').textContent=`Groq ${snapshot.credentialsPresent?.groq?'configured':'needs key'} · Gemini ${snapshot.credentialsPresent?.gemini?'configured':'needs key'} · Node website runs without keys`;
   const testResult=parseTestOutput(audit?.independentGate);
@@ -192,17 +194,24 @@ function updateLabels(){
     else label.textContent='RUNNING';
   }else if(mode==='reference'){label.textContent='MANUAL FIX';label.classList.add('pass')}
   else if(mode==='preview')label.textContent='SCRIPTED ONLY';
-  else label.textContent='STARTER';
+  else label.textContent=installed?'LOCAL FEATURE':'STARTER';
+  document.querySelector('.preview-description').textContent=installed
+    ? 'Showing the current local feature. It has not been verified by a live agent run in this session.'
+    : 'After a passing live run, this preview reloads with whatever the team built.';
   for(const b of document.querySelectorAll('.mission button'))b.disabled=snapshot.running;
-  requestBox.disabled=snapshot.running||(mode==='live'&&snapshot.runOutcome!=='idle');
-  if(snapshot.featureRequest&&requestBox.value!==snapshot.featureRequest&&(snapshot.running||mode==='live'||mode==='reference')){requestBox.value=snapshot.featureRequest;renderPresets()}
+  $('run').disabled=snapshot.running;
+  $('run-notice').textContent=snapshot.running?'An agent run is in progress.':needsReset
+    ? 'This run will extend the installed feature and preserve its existing acceptance tests. Reset is optional and replaces the feature with the empty starter.'
+    : 'Ready for a new agent run.';
+  requestBox.disabled=snapshot.running;
+  if(snapshot.featureRequest&&requestBox.value!==snapshot.featureRequest&&(snapshot.running||mode==='reference')){requestBox.value=snapshot.featureRequest;renderPresets()}
 }
 async function poll(){
   try{
     const resp=await fetch('/api/state',{cache:'no-store'});
     if(!resp.ok)throw new Error('Server state unavailable');
     const next=await resp.json();
-    if(next.runId!==snapshot.runId){audit=null;seenEvents.clear();lastActiveRole=null;previousSignature='';lastOutcome='idle'}
+    if(next.runId!==snapshot.runId){audit=null;seenEvents.clear();lastActiveRole=null;previousSignature='';lastOutcome='idle';if(next.featureRequest){requestBox.value=next.featureRequest;renderPresets()}}
     snapshot=next;
     if(snapshot.mode==='live'&&snapshot.runId){
       try{const r=await fetch('/api/audit',{cache:'no-store'});if(r.ok)audit=await r.json()}catch{}

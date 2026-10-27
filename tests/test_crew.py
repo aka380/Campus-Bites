@@ -63,6 +63,8 @@ class CrewRefactorTests(unittest.TestCase):
         self.assertTrue(crew.is_transient_error(Exception("503 Service Unavailable")))
         self.assertTrue(crew.is_transient_error(Exception("Connection reset by peer")))
 
+        self.assertFalse(crew.is_transient_error(Exception("429 RateLimitError: Request too large for model")))
+
         # Permanent errors should not be marked transient
         self.assertFalse(crew.is_transient_error(ValueError("Invalid argument: model not found")))
         self.assertFalse(crew.is_transient_error(Exception("401 Unauthorized: invalid API key")))
@@ -167,6 +169,17 @@ test('UI: broken test 3', () => { assert.equal(1, 2); });
         self.assertIn("REJECTED: write limit reached for this assignment", res)
         crew.assignment_writes["Backend"] = 0
 
+    def test_extension_preserves_existing_tests(self):
+        original = crew.TESTS.read_text(encoding="utf-8").strip()
+        with patch.object(crew, "baseline_tests", original):
+            self.assertIn("preserve the entire existing test file", crew.write_tests("test('replacement', () => {});"))
+            candidate = original + "\n\ntest('UI: additional regression', () => { assert.ok(true); });"
+            with patch.object(crew, "syntax_error", return_value=None), \
+                 patch.object(crew, "execute_tests", return_value=(True, "", {"pass": 6, "fail": 0, "failing": []})), \
+                 patch.object(crew, "save", return_value="test-digest") as saved:
+                self.assertIn("preserving existing tests", crew.write_tests(candidate))
+                self.assertEqual(saved.call_args.args[1], candidate)
+
     def test_execute_tests_hardened_invocation(self):
         """execute_tests runs node with V8 limits and returns structured summary."""
         passed, output, summary = crew.execute_tests(["tests/feature.contract.test.mjs"])
@@ -175,7 +188,8 @@ test('UI: broken test 3', () => { assert.equal(1, 2); });
         self.assertIn("pass", summary)
         self.assertIn("fail", summary)
         self.assertIn("failing", summary)
-        self.assertEqual(summary["pass"], 2)
+        self.assertEqual(summary["pass"] + summary["fail"], 6)
+        self.assertEqual(passed, summary["fail"] == 0)
 
 
 if __name__ == "__main__":

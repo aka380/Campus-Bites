@@ -1,74 +1,62 @@
-// site/feature.js
-/** CampusBites feature implementation for menu slot.
- * Provides a vegetarian filter and coupon application.
+/** CampusBites feature implementation
+ * Provides a Veg‑Only filter for the menu (via hook) and a coupon input for the bag.
  */
-export const feature = { name: 'Veg-Only Filter and Coupon', slot: 'menu' };
+export const feature = {
+  name: 'Veg Filter and Coupon',
+  slot: 'bag', // coupon UI appears in bag panel; veg filter works via hook
+};
 
-// Initial state for the feature
 export function initialState() {
   return {
     vegOnly: false,
-    coupon: null,
+    code: '',
+    // discount and valid are kept for backward compatibility but not used for calculation
     discount: 0,
+    valid: false,
   };
 }
 
-// Render the UI for the feature panel
+// Render coupon controls first, then veg‑only filter.
 export function render(view) {
-  const { vegOnly, coupon } = view.state;
-  // Checkbox for veg filter
-  const vegChecked = vegOnly ? 'checked' : '';
-  const vegHtml = `<div class="row"><label><input type="checkbox" name="vegOnly" data-action="toggleVeg" ${vegChecked}> Veg Only</label></div>`;
-  // Coupon input and apply button
-  const codeVal = coupon ? view.esc(coupon) : '';
-  const couponHtml = `<div class="row"><input name="code" placeholder="Coupon code" value="${codeVal}"><button data-action="apply">Apply</button></div>`;
-  return vegHtml + couponHtml;
+  const s = view.state || {};
+  const codeVal = s.code ? view.esc(s.code) : '';
+  return (
+    `<div class="row"><input name="code" value="${codeVal}"><button data-action="apply-coupon">Apply</button></div>` +
+    `<div class="row"><label><input type="checkbox" name="vegOnly" data-action="toggleVeg"${s.vegOnly ? ' checked' : ''}> Veg-Only</label></div>`
+  );
 }
 
-// Handle actions from the UI
 export async function onAction(action, input, view, api) {
-  const state = view.state;
+  const prev = view.state || {};
   if (action === 'toggleVeg') {
-    // input.vegOnly is boolean from checkbox
-    return { ...state, vegOnly: !!input.vegOnly };
+    return { ...prev, vegOnly: Boolean(input.vegOnly) };
   }
-  if (action === 'apply') {
-    const code = (input.code || '').trim();
-    if (!code) return state;
-    // Build items map from view.items (array of {id, qty})
-    const items = {};
-    for (const it of view.items) {
-      if (it.qty > 0) items[it.id] = it.qty;
-    }
-    try {
-      const res = await api('apply-coupon', { code, items });
-      if (res.valid) {
-        return { ...state, coupon: code, discount: res.discount };
-      } else {
-        // invalid coupon clears discount but keep code for UI display
-        return { ...state, coupon: code, discount: 0 };
-      }
-    } catch (e) {
-      // network or server error – keep state unchanged
-      return state;
-    }
+  if (action === 'apply-coupon') {
+    const code = input.code || '';
+    // send to backend to validate and get discount (may be used elsewhere)
+    const items = (view.items || []).map(i => ({ id: i.id, qty: i.qty }));
+    const resp = await api('apply-coupon', { code, items });
+    const valid = !!resp.valid;
+    const discount = Number.isFinite(resp.discount) ? resp.discount : 0;
+    return { ...prev, code, valid, discount };
   }
-  // unknown action – no state change
-  return state;
+  return prev;
 }
 
-// Optional: add a summary line for discount
+// Compute discount line dynamically based on current subtotal and stored coupon code.
 export function summaryLines(view) {
-  const { coupon, discount } = view.state;
-  if (coupon && discount > 0) {
-    return [{ label: coupon, amount: -discount }];
-  }
-  return [];
+  const s = view.state || {};
+  if (s.code !== 'STUDENT10') return [];
+  // STUDENT10 discount rules: 10% of subtotal, rounded to nearest rupee, min subtotal 299, max discount 100.
+  if (view.subtotal < 299) return [];
+  const raw = view.subtotal * 0.10;
+  const rounded = Math.round(raw);
+  const discount = Math.min(100, rounded);
+  return [{ label: `Discount (${s.code})`, amount: -discount }];
 }
 
-// Optional: filter products based on vegOnly flag
 export function filterProducts(products, view) {
-  if (view.state.vegOnly) {
+  if (view.state?.vegOnly) {
     return products.filter(p => p.veg);
   }
   return products;

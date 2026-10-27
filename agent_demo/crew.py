@@ -102,6 +102,7 @@ write_counts = {"Backend": 0, "Frontend": 0, "QA": 0}
 assignment_writes = {"Backend": 0, "Frontend": 0, "QA": 0}
 qa_runs = 0
 tests_sha = None
+baseline_tests = None  # Set by main only when extending an existing implementation.
 last_test_summary = {"pass": 0, "fail": 0, "failing": []}
 supervisor = SupervisorState(max_corrections=int(os.getenv("CAMPUSBITES_MAX_CORRECTIONS", "1")))
 
@@ -165,7 +166,7 @@ def reset_run_state(new_run_id: str | None = None) -> None:
     """Reset module execution tracking state for clean programmatic runs."""
     global RUN_ID, RUN_DIR, start_time, changed, records, step_outputs, manager_decisions
     global write_counts, assignment_writes, qa_runs, tests_sha, last_test_summary, supervisor
-    global request_counts, last_call_at
+    global request_counts, last_call_at, baseline_tests
 
     RUN_ID = re.sub(r"[^a-zA-Z0-9_-]", "", os.getenv("CAMPUSBITES_RUN_ID", "")) or (
         new_run_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -181,6 +182,7 @@ def reset_run_state(new_run_id: str | None = None) -> None:
     assignment_writes = {"Backend": 0, "Frontend": 0, "QA": 0}
     qa_runs = 0
     tests_sha = None
+    baseline_tests = None
     last_test_summary = {"pass": 0, "fail": 0, "failing": []}
     supervisor = SupervisorState(max_corrections=int(os.getenv("CAMPUSBITES_MAX_CORRECTIONS", "1")))
     request_counts = {"gemini": 0, "groq": 0}
@@ -384,12 +386,16 @@ def write_tests(content: str) -> str:
     content = content.strip()
     if assignment_writes["QA"] >= MAX_WRITES_PER_ASSIGNMENT:
         return "REJECTED: write limit reached. Report the last result."
-    problem = check_rules(content, exports=[], min_len=200, max_len=7000,
+    if baseline_tests is not None and (
+        not content.startswith(baseline_tests + "\n") or test_count(content) <= test_count(baseline_tests)
+    ):
+        return "REJECTED: preserve the entire existing test file unchanged and append new test() blocks."
+    problem = check_rules(content, exports=[], min_len=200, max_len=14000 if baseline_tests is not None else 7000,
                           blocked=COMMON_BLOCKED + [r"\bfetch\s*\(", r"\bimport\s*\(", r"^\s*import\s*['\"]"])
     imports = re.findall(r"^\s*import\b[^;]*?from\s*['\"]([^'\"]+)['\"]", content, re.M)
     if not problem and (not imports or any(i not in TESTS_ALLOWED_IMPORTS for i in imports)):
         problem = f"REJECTED: tests may import only {sorted(TESTS_ALLOWED_IMPORTS)}"
-    if not problem and not 3 <= test_count(content) <= 10:
+    if not problem and not 3 <= test_count(content) <= (test_count(baseline_tests) + 8 if baseline_tests is not None else 10):
         problem = f"REJECTED: write 3 to 10 test() blocks (found {test_count(content)})"
     if not problem and (error := syntax_error(content, ".mjs")):
         problem = "REJECTED: invalid JavaScript syntax: " + error
@@ -414,17 +420,21 @@ def write_tests(content: str) -> str:
         return err_msg
 
     # Test-first rule: tests must fail before any feature code exists
-    if summary["fail"] == 0:
+    if summary["fail"] == 0 and baseline_tests is None:
         emit("QA", "Tests rejected: they pass without the feature", "Tests must fail until the feature exists.", "error")
         return "REJECTED: these tests already pass with no feature installed, so they test nothing. Rewrite them."
 
     genuine_failures = [f for f in summary["failing"] if not f.endswith(".mjs")]
-    if not genuine_failures:
+    if not genuine_failures and baseline_tests is None:
         err_msg = "REJECTED: no genuine test assertion failures detected. Check test() blocks."
         emit("QA", "Tests rejected: no assertion failures", err_msg, "error")
         return err_msg
 
     tests_sha = save(TESTS, content, "QA")
+    if baseline_tests is not None:
+        emit("QA", "Regression tests preserved; new coverage saved",
+             f"{test_count(content)} tests; {summary['pass']} pass / {summary['fail']} fail against the existing implementation", "test")
+        return f"SAVED {test_count(content)} tests, preserving existing tests. {summary['pass']} pass / {summary['fail']} fail. Passing new tests indicate existing behavior already satisfies those assertions."
     emit("QA", "Acceptance tests written (failing, as expected)",
          f"{test_count(content)} tests; {summary['fail']} fail before any code exists", "test")
     return f"SAVED {test_count(content)} tests. They fail now, as they should before the code exists. Stop and report."
@@ -434,6 +444,8 @@ def is_transient_error(exc: Exception) -> bool:
     """Identify rate limits, timeouts, and transient server errors suitable for retry."""
     text = str(exc)
     exc_type = type(exc).__name__
+    if re.search(r"request too large|payload too large|context.{0,20}(length|window)|maximum context", text, re.I):
+        return False
     if re.search(r"429|rate.?limit|quota|RESOURCE_EXHAUSTED", text, re.I):
         return True
     if re.search(r"timeout|timed out|deadline exceeded|502|503|504|bad gateway|service unavailable|connection.*reset|econnreset|remotedisconnected", text, re.I):
@@ -470,7 +482,7 @@ def write_run_summary(rc: int) -> None:
 
 
 def main() -> int:
-    global qa_runs, last_test_summary
+    global qa_runs, last_test_summary, baseline_tests
     rc = 1
     try:
         emit("System", "Run initialized", f"Run ID: {RUN_ID}; feature request: {FEATURE_REQUEST}", "start")
@@ -483,10 +495,12 @@ def main() -> int:
             rc = 2
             return rc
 
-        if not TESTS.exists() or not STARTER_TESTS.exists() or TESTS.read_text(encoding="utf-8") != STARTER_TESTS.read_text(encoding="utf-8"):
-            emit("System", "Workspace is not reset", "Click Reset in /office (or copy facilitator/starter/*) before a new run.", "error")
-            rc = 2
-            return rc
+        baseline_tests = None
+        if TESTS.exists() and STARTER_TESTS.exists() and TESTS.read_text(encoding="utf-8") != STARTER_TESTS.read_text(encoding="utf-8"):
+            baseline_tests = TESTS.read_text(encoding="utf-8").strip()
+            for target in (FRONTEND, BACKEND, TESTS):
+                (RUN_DIR / ("baseline-" + target.name)).write_bytes(target.read_bytes())
+            emit("System", "Extending existing feature", "Existing source and tests backed up. QA must append coverage without changing existing acceptance tests.", "info")
 
         try:
             from crewai import Agent, Crew, LLM, Process, Task
@@ -572,7 +586,7 @@ def main() -> int:
                 return "REJECTED: source_code must be provided as a non-empty string"
             return write_tests(source_code)
 
-        @tool("write_backend_source")
+        @tool("write_backend_source", result_as_answer=True)
         def write_backend_source(source_code: str) -> str:
             """Write the COMPLETE api/feature.mjs file exporting handle(action, body, ctx). Returns test results for API tests."""
             emit("Backend", "Tool called: write_backend_source", "Guardrail check, syntax check, save, run tests", "tool")
@@ -580,7 +594,7 @@ def main() -> int:
                 return "REJECTED: source_code must be provided as a non-empty string"
             return write_code(BACKEND, source_code, "Backend", ["handle"], CODE_BLOCKED, "API:")
 
-        @tool("write_frontend_source")
+        @tool("write_frontend_source", result_as_answer=True)
         def write_frontend_source(source_code: str) -> str:
             """Write the COMPLETE site/feature.js file exporting feature, initialState, render, onAction. Returns test results for UI tests."""
             emit("Frontend", "Tool called: write_frontend_source", "Guardrail check, syntax check, save, run tests", "tool")
@@ -680,6 +694,29 @@ def main() -> int:
                  decision["reason"], "decision", evidence={"artifact": "manager-decisions.json", "assignment": target})
             return decision
 
+        product_context = "\nACTUAL CATALOG: burger 179 nonveg; pizza 259 veg; biryani 229 nonveg; fries 129 veg; roll 169 veg; brownie 119 veg.\n"
+        if DISCOUNT_DEMO:
+            product_context += (
+                "\nMANDATORY DISCOUNT CHECKS: API apply-coupon accepts items [{id,qty}], ignores client prices, "
+                "returns valid and discount. STUDENT10: minimum 299, rounded 10%, cap 100; "
+                "pizza+biryani=488 gives 49, pizza=259 gives 0, pizza qty10 gives 100; invalid code gives 0. "
+                "Coupon input and Apply button must precede other controls in the bag panel. "
+                "summaryLines recalculates from view.subtotal after cart changes, never a cached discount. "
+                "Keep a visible Veg-Only checkbox when requested.\n"
+            )
+        product_context += (
+            "\nFeature exports are summaryLines(view) and filterProducts(products, view). "
+            "Tests MUST call summaryLines(ui, view) and filterProducts(ui, PRODUCTS, view). "
+            "Feature exports NEVER take the ui argument.\n"
+        )
+        if baseline_tests is not None:
+            product_context += "\nEXTEND EXISTING FEATURE: preserve all existing functionality; make the smallest changes. Do not reset.\n"
+        qa_instructions = (
+            "Preserve this ENTIRE existing test file verbatim as the start of your output, including imports. "
+            "APPEND 2 to 4 new tests using its existing imported helpers; do not duplicate imports.\n"
+            + baseline_tests + "\nExisting frontend:\n" + FRONTEND.read_text(encoding="utf-8")
+            if baseline_tests is not None else "Write 4 to 8 acceptance tests."
+        )
         spec = ""
         for _ in range(14):
             decision = manager_review()
@@ -696,7 +733,7 @@ def main() -> int:
             if role == "Architect":
                 spec = phase(
                     "Architect", "Turn a product request into a precise, testable spec for the CampusBites feature contract.",
-                    f"Feature request from the product owner: \"{FEATURE_REQUEST}\"\n\n{CONTRACT}\n\n"
+                    f"Feature request from the product owner: \"{FEATURE_REQUEST}\"\n\n{CONTRACT}\n{product_context}\n"
                     "Write a SHORT spec (max 250 words) in exactly this format, no code:\n"
                     "FEASIBLE: yes  (or 'FEASIBLE: no - reason' if it needs real payments, GPS, logins, email/SMS, "
                     "external services, or changes outside the two feature files)\n"
@@ -715,8 +752,8 @@ def main() -> int:
             elif role == "QA" and supervisor.phase == "write_tests":
                 assignment_writes["QA"] = 0
                 phase("QA", "Write acceptance tests from the spec before any code exists.",
-                      f"Feature request: \"{FEATURE_REQUEST}\"\nSPEC:\n{spec[:2500]}\n\n{CONTRACT}\n\n"
-                      "Write tests/feature.acceptance.test.mjs: 4 to 8 tests that check the ACCEPTANCE criteria. "
+                      f"Feature request: \"{FEATURE_REQUEST}\"\nSPEC:\n{spec[:2500]}\n\n{CONTRACT}\n{product_context}\n"
+                      f"Write tests/feature.acceptance.test.mjs. {qa_instructions}\nCheck the ACCEPTANCE criteria. "
                       "Use only the imports shown in the contract. Name tests 'API: ...' or 'UI: ...'. "
                       "Compute expected numbers carefully from the real menu prices. Test behaviour, not exact HTML "
                       "(use assert.match with key words). Call write_acceptance_tests once with the COMPLETE file; "
@@ -730,14 +767,25 @@ def main() -> int:
                                         else (FRONTEND, write_frontend_source, "site/feature.js"))
                 prior = write_counts[role]
                 assignment_writes[role] = 0
-                phase(role, f"Implement {owns} so the acceptance tests pass.",
-                      f"Feature request: \"{FEATURE_REQUEST}\"\nSPEC:\n{spec[:2500]}\n\n{CONTRACT}\n\n"
-                      f"ACCEPTANCE TESTS (do not change them):\n{TESTS.read_text(encoding='utf-8')[:6500]}\n\n"
-                      f"CURRENT {owns}:\n{target.read_text(encoding='utf-8')}\n\n"
-                      f"You own ONLY {owns}. Call {writer.name} with the COMPLETE file. The tool runs the tests and "
-                      "lists failures in your area; if any remain, fix them and call it once more. "
-                      "Final answer: one line with the last tool result.",
-                      "The last tool result", [writer], max_iter=4)
+                for _write_attempt in range(MAX_WRITES_PER_ASSIGNMENT):
+                    _, latest_output, latest_summary = execute_tests()
+                    latest_failures = failure_details(latest_output, latest_summary["failing"])
+                    phase(role, f"Implement {owns} so the acceptance tests pass.",
+                          f"Feature request: {FEATURE_REQUEST}\nSPEC:\n{spec[:2500]}\n{CONTRACT}\n{product_context}\n"
+                          f"ACCEPTANCE TESTS:\n{TESTS.read_text(encoding='utf-8')[:6500]}\n"
+                          f"CURRENT {owns}:\n{target.read_text(encoding='utf-8')}\n"
+                          f"VERIFIED FAILURES:\n{latest_failures}\n"
+                          f"You own ONLY {owns}. Call {writer.name} ONCE with the COMPLETE file. "
+                          "The tool result ends this assignment; the host will check it and request a fresh correction if needed.",
+                          "The tool result", [writer], max_iter=2)
+                    _, _, checked_summary = execute_tests()
+                    prefix = "API:" if role == "Backend" else "UI:"
+                    owned_failures = [name for name in checked_summary["failing"]
+                                      if name.startswith(prefix) or
+                                      (role == "Frontend" and name.startswith("Contract:") and "backend" not in name.lower()) or
+                                      (role == "Backend" and "backend" in name.lower())]
+                    if write_counts[role] > prior and not owned_failures:
+                        break
                 if write_counts[role] <= prior:
                     raise RuntimeError(f"{role} was assigned but did not save any code")
                 supervisor.mark_finished(role)
@@ -779,6 +827,7 @@ def main() -> int:
             "manager closed after QA passed": supervisor.closed and bool(supervisor.qa_passed),
             "QA wrote the tests in this run": tests_sha is not None and sha256(tests_now) == tests_sha,
             "at least 3 acceptance tests": test_count(tests_now) >= 3,
+            "existing acceptance tests preserved": baseline_tests is None or tests_now.startswith(baseline_tests + "\n"),
             "Backend and Frontend wrote code": {"Backend", "Frontend"} <= changed,
             "all mandatory audit artifacts present": all(required_artifacts.values()),
             "manager recorded complete decision": any(d.get("assign") == "COMPLETE" for d in manager_decisions),
